@@ -80,6 +80,10 @@ RAMP(TargetSpeed, 10, 5)
 PID(FlowSensor, 50, 1.2, 0.3, 0.05)
 ```
 
+**Documentation**
+https://docs.google.com/document/d/1KdkB8BtieTk5un02kl3CuF5Xg3J6uxHhwuBDASOmFMo/edit?usp=sharing
+
+
 ---
 
 ## Publish Policies
