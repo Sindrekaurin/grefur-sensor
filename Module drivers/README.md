@@ -1,4 +1,4 @@
-# grefur I2C Ecosystem
+# Grefur I2C Ecosystem
 
 This repository contains the core communication framework for **grefur AS** hardware. The system is designed to provide high-quality, plug-and-play simplicity for SaaS-connected sensors.
 
