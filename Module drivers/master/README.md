@@ -1,6 +1,6 @@
 # Grefur_Master_Driver
 
-The orchestration engine for **grefur** Gateways. This library manages the communication bus, discovers connected sensors (slaves), and provides high-level methods to poll data.
+The orchestration engine for *Grefur-sensor*. This library manages the communication bus, discovers connected sensors (slaves), and provides high-level methods to poll data.
 
 ## Features
 
