@@ -45,6 +45,67 @@ Grefur supports direct connection of physical hardware:
 
 ---
 
+## Grefur Module Bus – I2C Expansion
+
+The Grefur Backplate exposes a dedicated **I2C expansion bus**, enabling seamless integration of purpose-built add-on modules. This transforms the backplate from a fixed-function device into an open, scalable platform.
+
+### How it works
+
+The host controller acts as the **I2C master**. Each connected module runs the **Grefur Slave Driver** and responds to a standardized discovery and data protocol. On startup, the master scans the bus, reads each module's register map, and makes all discovered values immediately available to the logic engine and MQTT pipeline — with no manual configuration required.
+
+```
+Grefur Backplate (master)
+    │
+    ├── SDA ──────────────────────────────────┐
+    ├── SCL ──────────────────────────────────┤
+    │                                         │
+    ├─── Module 0x10 ── Module 0x11 ── Module 0x12 ── ...
+         (e.g. relay)   (e.g. CO₂)    (e.g. PWM out)
+```
+
+### What the bus gives you
+
+| Capability | Detail |
+|---|---|
+| **Up to 16 modules** per bus | Each module gets a unique I2C address |
+| **Up to 16 registers per module** | Mix of readable inputs and writable outputs |
+| **Auto-discovery** | Master enumerates all modules and their register maps at startup |
+| **Typed data** | Registers carry a data type (`U8`, `I16`, `U16`, `I32`, `F32`) — no guessing |
+| **Named registers** | Each register has a human-readable name, surfaced directly in the web UI |
+| **Bidirectional** | Modules can expose both sensor inputs (read) and actuator outputs (write) |
+| **Hot-swap friendly** | Online status is tracked per module; offline detection built in |
+| **Open specification** | Anyone can build a compatible module using the published slave driver |
+
+### Why this matters for the backplate
+
+The I2C bus turns the backplate into a **hub**, not just a controller. Instead of designing one device that does everything, you design one backplate that does the essentials and expand it with modules purpose-built for your application:
+
+- Need CO₂ measurement? Plug in a CO₂ module.
+- Need 4-channel relay output? Plug in a relay module.
+- Need a PWM motor driver? Plug in a PWM module.
+
+Each module's registers appear automatically in the Grefur web UI as sensors or actuators — readable values feed directly into the logic engine, and writable registers become actuator targets. The full power of the expression engine (`HYST`, `PID`, `RAMP`, etc.) is immediately available against any module value.
+
+### Designing a compatible module
+
+Any microcontroller with I2C slave capability can become a Grefur module. The **Grefur Slave Driver** library handles the entire protocol:
+
+```cpp
+GrefurSlaveModule mod(0x1234);        // device ID
+
+float temperature = 0.0f;
+uint8_t fanSpeed  = 0;
+
+mod.addRegister(0x0010, GREFUR_T_F32, false, "temperature", &temperature);
+mod.addRegister(0x0020, GREFUR_T_U8,  true,  "fanSpeed",    &fanSpeed);
+
+mod.begin(0x10);                      // I2C address on the bus
+```
+
+That's it. The master will discover both registers, expose `temperature` as a readable sensor, and `fanSpeed` as a writable actuator — all without any additional configuration on the host side.
+
+---
+
 ## Logic Engine – Programming on the Device
 
 Grefur includes a built-in expression engine that lets you define automation rules directly on the controller. No external PLC or scripting environment needed.
