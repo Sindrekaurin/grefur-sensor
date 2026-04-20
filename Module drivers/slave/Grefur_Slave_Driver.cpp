@@ -12,7 +12,7 @@ GrefurSlaveModule::GrefurSlaveModule(uint16_t deviceId)
     : _deviceId(deviceId),
       _regCount(0),
       _writeCallback(nullptr),
-      _selectedAddr(0),
+      _selectedAddr16(0),   // uint16_t — 2-byte register address
       _discoveryIdx(0),
       _pendingWrite(false),
       _pendingRegAddr(0),
@@ -40,9 +40,8 @@ void GrefurSlaveModule::onWrite(GrefurWriteCallback callback) {
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Add Register
-// name is strncpy'd into a fixed buffer — no dangling pointer risk
 // ─────────────────────────────────────────────────────────────────────────────
-void GrefurSlaveModule::addRegister(uint8_t addr, uint8_t type, bool writable, const char* name, void* ptr) {
+void GrefurSlaveModule::addRegister(uint16_t addr, uint8_t type, bool writable, const char* name, void* ptr) {
     if (_regCount >= GREFUR_MAX_REGS) return;
     GrefurSlaveReg& r = _regs[_regCount++];
     r.addr     = addr;
@@ -69,7 +68,6 @@ uint8_t GrefurSlaveModule::_getTypeSize(uint8_t type) {
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Apply a pending write to the register's dataPtr
-// Called from _handleRequest (still inside Wire ISR context) — kept minimal
 // ─────────────────────────────────────────────────────────────────────────────
 void GrefurSlaveModule::_applyPendingWrite() {
     if (!_pendingWrite) return;
@@ -82,7 +80,6 @@ void GrefurSlaveModule::_applyPendingWrite() {
         uint8_t size = _getTypeSize(r.type);
         if (_pendingLen < size) return;
 
-        // Reconstruct raw value from big-endian bytes
         uint32_t raw = 0;
         for (uint8_t b = 0; b < size; b++) raw = (raw << 8) | _pendingBuf[b];
 
@@ -91,12 +88,9 @@ void GrefurSlaveModule::_applyPendingWrite() {
             case GREFUR_T_U16: *(uint16_t*)r.dataPtr = (uint16_t)raw; break;
             case GREFUR_T_I16: *(int16_t*)r.dataPtr  = (int16_t)raw;  break;
             case GREFUR_T_I32: *(int32_t*)r.dataPtr  = (int32_t)raw;  break;
-            case GREFUR_T_F32:
-                memcpy(r.dataPtr, &raw, 4); // IEEE 754 bit-reinterpretation
-                break;
+            case GREFUR_T_F32: memcpy(r.dataPtr, &raw, 4);            break;
         }
 
-        // Fire write callback if registered
         if (_writeCallback) {
             _writeCallback(r.addr, _pendingBuf, size);
         }
@@ -106,29 +100,30 @@ void GrefurSlaveModule::_applyPendingWrite() {
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Wire ISR: Receive (master writes to us)
+// Expects: [addrHi(1), addrLo(1), ...payload...]
 // ─────────────────────────────────────────────────────────────────────────────
 void GrefurSlaveModule::_handleReceive(int n) {
-    if (n < 1 || !_instance) return;
+    if (n < 2 || !_instance) return;
 
-    _instance->_selectedAddr = Wire.read();
+    uint8_t hi = Wire.read();
+    uint8_t lo = Wire.read();
+    uint16_t addr = ((uint16_t)hi << 8) | lo;
+    _instance->_selectedAddr16 = addr;
 
-    if (n > 1) {
-        if (_instance->_selectedAddr == 0x00) {
+    if (n > 2) {
+        if (addr == 0x0000) {
             // Discovery mode: next byte is register index to describe
             _instance->_discoveryIdx = Wire.read();
         } else {
-            // Write to a data register — buffer the bytes, apply them safely
+            // Write to a data register — buffer the payload bytes
             uint8_t avail = Wire.available();
             if (avail > 4) avail = 4;
             for (uint8_t i = 0; i < avail; i++) {
                 _instance->_pendingBuf[i] = Wire.read();
             }
             _instance->_pendingLen     = avail;
-            _instance->_pendingRegAddr = _instance->_selectedAddr;
+            _instance->_pendingRegAddr = addr;
             _instance->_pendingWrite   = true;
-
-            // Apply immediately while still in ISR context
-            // (Wire callbacks on ESP32 run in task context, not true ISR — this is safe)
             _instance->_applyPendingWrite();
         }
     }
@@ -143,28 +138,29 @@ void GrefurSlaveModule::_handleReceive(int n) {
 void GrefurSlaveModule::_handleRequest() {
     if (!_instance) return;
 
-    uint8_t sel = _instance->_selectedAddr;
+    uint16_t sel = _instance->_selectedAddr16;
 
-    // ── 0x00: Metadata Discovery ─────────────────────────────────────────────
-    if (sel == 0x00) {
+    // ── 0x0000: Metadata Discovery ────────────────────────────────────────────
+    if (sel == 0x0000) {
         uint8_t idx = _instance->_discoveryIdx;
         if (idx < _instance->_regCount) {
             GrefurSlaveReg& r = _instance->_regs[idx];
             uint8_t nLen = strnlen(r.name, GREFUR_NAME_LEN);
-            Wire.write(_instance->_regCount);   // Total register count
-            Wire.write(r.addr);                  // Register address
-            Wire.write(r.type);                  // Data type
-            Wire.write((uint8_t)r.writable);     // Writable flag
-            Wire.write(nLen);                    // Name length
-            Wire.write((const uint8_t*)r.name, nLen); // Name bytes
+            Wire.write(_instance->_regCount);          // Total register count
+            Wire.write((r.addr >> 8) & 0xFF);          // Register address MSB
+            Wire.write(r.addr & 0xFF);                 // Register address LSB
+            Wire.write(r.type);                        // Data type
+            Wire.write((uint8_t)r.writable);           // Writable flag
+            Wire.write(nLen);                          // Name length
+            Wire.write((const uint8_t*)r.name, nLen);  // Name bytes
         } else {
             Wire.write((uint8_t)0x00);
         }
         return;
     }
 
-    // ── 0x01: Device ID ───────────────────────────────────────────────────────
-    if (sel == 0x01) {
+    // ── 0x0001: Device ID ─────────────────────────────────────────────────────
+    if (sel == 0x0001) {
         Wire.write(_instance->_deviceId >> 8);
         Wire.write(_instance->_deviceId & 0xFF);
         return;
@@ -177,8 +173,6 @@ void GrefurSlaveModule::_handleRequest() {
 
         uint8_t size = _instance->_getTypeSize(r.type);
 
-        // Read raw bytes from dataPtr and send big-endian
-        // Handles all types including F32 correctly via memcpy
         uint32_t raw = 0;
         if (r.type == GREFUR_T_F32) {
             memcpy(&raw, r.dataPtr, 4);
@@ -196,7 +190,6 @@ void GrefurSlaveModule::_handleRequest() {
         return;
     }
 
-    // Unknown register — send size-matched 0xFF bytes to avoid master desync
-    // Master will receive expected byte count but with sentinel value
+    // Unknown register — send 0xFF as sentinel to avoid master desync
     Wire.write((uint8_t)0xFF);
 }
