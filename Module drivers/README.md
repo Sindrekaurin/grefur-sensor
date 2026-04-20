@@ -31,7 +31,8 @@ Use the `Grefur_Slave_Driver`. Map your local variables to I2C registers using `
 ### 2. Creating a Gateway (Master)
 Use the `Grefur_Master_Driver`. Run `scanAndDiscover()` to populate a list of all active sensors on the bus. Use `pollDevice()` to fetch live data for further processing or cloud uplink.
 
-<img width="628" height="363" alt="image" src="https://github.com/user-attachments/assets/5d7a7f40-5eed-4a1f-8282-5da0bc8e36e6" />
+<img width="719" height="310" alt="image" src="https://github.com/user-attachments/assets/090799c6-ce81-42cf-b02e-3524611bfb25" />
+
 
 
 ---
