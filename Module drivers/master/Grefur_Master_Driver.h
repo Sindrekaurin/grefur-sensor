@@ -19,6 +19,15 @@
 #define GREFUR_T_I32  0x04
 #define GREFUR_T_F32  0x05
 
+// ─── Error Codes ──────────────────────────────────────────────────────────────
+#define GREFUR_ERR_DEVICE_OFFLINE    0x10
+#define GREFUR_ERR_READ_FAILED       0x11
+#define GREFUR_ERR_WRITE_FAILED      0x12
+#define GREFUR_ERR_BAD_DEVICE_IDX    0x13
+#define GREFUR_ERR_BAD_REGISTER_IDX  0x14
+#define GREFUR_ERR_NOT_WRITABLE      0x15
+#define GREFUR_ERR_DISCOVERY_FAILED  0x16
+
 // ─── Register Value Union ─────────────────────────────────────────────────────
 union GrefurValue {
     uint32_t asU32;
@@ -50,8 +59,12 @@ struct GrefurDevice {
     bool            online;
 };
 
-// ─── Change Callback Type ─────────────────────────────────────────────────────
+// ─── Callback Types ───────────────────────────────────────────────────────────
 typedef void (*GrefurChangeCallback)(uint8_t devIdx, uint8_t regIdx, GrefurValue newValue);
+typedef void (*GrefurMasterWriteCallback)(uint8_t devIdx, uint8_t regIdx, GrefurValue value);
+typedef void (*GrefurMasterReadCallback)(uint8_t devIdx, uint8_t regIdx, GrefurValue value);
+typedef void (*GrefurMasterErrorCallback)(uint8_t errorCode, uint8_t devIdx);
+typedef void (*GrefurDeviceCallback)(uint8_t devIdx);   // onDiscovery, onActivity, onOffline, onOnline
 
 // ─── Async Scan State ─────────────────────────────────────────────────────────
 enum GrefurScanState {
@@ -88,13 +101,20 @@ public:
     // ── Register Lookup ───────────────────────────────────────────────────────
     int8_t findRegisterByName(uint8_t devIdx, const char* name);
 
-    // ── Change Callback ───────────────────────────────────────────────────────
+    // ── Callbacks ─────────────────────────────────────────────────────────────
     void onValueChanged(GrefurChangeCallback callback);
+    void onWrite(GrefurMasterWriteCallback callback);      /* Triggered after master writes to a slave */
+    void onRead(GrefurMasterReadCallback callback);        /* Triggered after master reads from a slave */
+    void onError(GrefurMasterErrorCallback callback);      /* Triggered on any protocol or I2C error */
+    void onDiscovery(GrefurDeviceCallback callback);       /* Triggered when a new device is discovered */
+    void onActivity(GrefurDeviceCallback callback);        /* Triggered on any successful I2C transaction */
+    void onDeviceOffline(GrefurDeviceCallback callback);   /* Triggered when a device stops responding */
+    void onDeviceOnline(GrefurDeviceCallback callback);    /* Triggered when an offline device comes back */
 
     // ── Data Access ───────────────────────────────────────────────────────────
-    uint8_t      getDeviceCount()  const { return _deviceCount; }
-    GrefurDevice* getDevices()           { return _devices; }
-    GrefurDevice* getDevice(uint8_t idx) { return (idx < _deviceCount) ? &_devices[idx] : nullptr; }
+    uint8_t       getDeviceCount()  const { return _deviceCount; }
+    GrefurDevice* getDevices()            { return _devices; }
+    GrefurDevice* getDevice(uint8_t idx)  { return (idx < _deviceCount) ? &_devices[idx] : nullptr; }
 
     uint8_t     getDeviceAddress(uint8_t devIdx) const;
     uint8_t     getRegisterCount(uint8_t devIdx) const;
@@ -102,12 +122,10 @@ public:
     uint16_t    getRegisterAddress(uint8_t devIdx, uint8_t regIdx) const;
     uint8_t     getRegisterDataType(uint8_t devIdx, uint8_t regIdx) const;
 
-    // Typed getters by device/register index
     float    getFloat(uint8_t devIdx, uint8_t regIdx);
     int32_t  getInt(uint8_t devIdx, uint8_t regIdx);
     uint32_t getUInt(uint8_t devIdx, uint8_t regIdx);
 
-    // Typed getters by raw I2C + register address
     float   getValueAsFloat(uint8_t i2cAddr, uint16_t regAddr);
     int32_t getIntByAddress(uint8_t i2cAddr, uint16_t regAddr);
     float   getFloatByAddress(uint8_t i2cAddr, uint16_t regAddr);
@@ -115,18 +133,30 @@ public:
 private:
     GrefurDevice         _devices[GREFUR_MAX_DEVICES];
     uint8_t              _deviceCount;
-    GrefurChangeCallback _changeCallback;
+
+    GrefurChangeCallback      _changeCallback;
+    GrefurMasterWriteCallback _writeCallback;
+    GrefurMasterReadCallback  _readCallback;
+    GrefurMasterErrorCallback _errorCallback;
+    GrefurDeviceCallback      _discoveryCallback;
+    GrefurDeviceCallback      _activityCallback;
+    GrefurDeviceCallback      _offlineCallback;
+    GrefurDeviceCallback      _onlineCallback;
 
     GrefurScanState _scanState;
     uint8_t         _scanAddr;
     uint8_t         _scanRegIdx;
     bool            _scanWaitingRegs;
 
-    void _storeValue(GrefurMasterReg& reg, uint8_t* buf, uint8_t size);
-    bool _readRegisterBytes(uint8_t i2cAddr, uint16_t regAddr, uint8_t size, uint8_t* outBuf);
-    bool _writeRegisterBytes(uint8_t i2cAddr, uint16_t regAddr, uint8_t type, GrefurValue value);
-    bool _tryReconnect(uint8_t devIdx);  // Ping offline device and restore online flag
+    void    _storeValue(GrefurMasterReg& reg, uint8_t* buf, uint8_t size);
+    bool    _readRegisterBytes(uint8_t i2cAddr, uint16_t regAddr, uint8_t size, uint8_t* outBuf);
+    bool    _writeRegisterBytes(uint8_t i2cAddr, uint16_t regAddr, uint8_t type, GrefurValue value);
+    bool    _tryReconnect(uint8_t devIdx);
     uint8_t _getTypeSize(uint8_t type);
+
+    void _notifyError(uint8_t code, uint8_t devIdx) {
+        if (_errorCallback) _errorCallback(code, devIdx);
+    }
 };
 
 #endif
