@@ -7,6 +7,13 @@
 GrefurModuleMaster::GrefurModuleMaster()
     : _deviceCount(0),
       _changeCallback(nullptr),
+      _writeCallback(nullptr),
+      _readCallback(nullptr),
+      _errorCallback(nullptr),
+      _discoveryCallback(nullptr),
+      _activityCallback(nullptr),
+      _offlineCallback(nullptr),
+      _onlineCallback(nullptr),
       _scanState(GREFUR_SCAN_IDLE),
       _scanAddr(0x08),
       _scanRegIdx(0),
@@ -20,6 +27,42 @@ GrefurModuleMaster::GrefurModuleMaster()
 void GrefurModuleMaster::begin(int sda, int scl, uint32_t frequency) {
     Wire.begin(sda, scl);
     Wire.setClock(frequency);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Callback Setters
+// ─────────────────────────────────────────────────────────────────────────────
+
+void GrefurModuleMaster::onValueChanged(GrefurChangeCallback callback) {
+    _changeCallback = callback;
+}
+
+void GrefurModuleMaster::onWrite(GrefurMasterWriteCallback callback) {
+    _writeCallback = callback;
+}
+
+void GrefurModuleMaster::onRead(GrefurMasterReadCallback callback) {
+    _readCallback = callback;
+}
+
+void GrefurModuleMaster::onError(GrefurMasterErrorCallback callback) {
+    _errorCallback = callback;
+}
+
+void GrefurModuleMaster::onDiscovery(GrefurDeviceCallback callback) {
+    _discoveryCallback = callback;
+}
+
+void GrefurModuleMaster::onActivity(GrefurDeviceCallback callback) {
+    _activityCallback = callback;
+}
+
+void GrefurModuleMaster::onDeviceOffline(GrefurDeviceCallback callback) {
+    _offlineCallback = callback;
+}
+
+void GrefurModuleMaster::onDeviceOnline(GrefurDeviceCallback callback) {
+    _onlineCallback = callback;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -88,6 +131,7 @@ bool GrefurModuleMaster::_writeRegisterBytes(uint8_t i2cAddr, uint16_t regAddr, 
 // ─────────────────────────────────────────────────────────────────────────────
 // Internal: ping a device and restore online flag if reachable
 // ─────────────────────────────────────────────────────────────────────────────
+
 bool GrefurModuleMaster::_tryReconnect(uint8_t devIdx) {
     GrefurDevice& dev = _devices[devIdx];
     if (dev.online) return true;
@@ -95,7 +139,7 @@ bool GrefurModuleMaster::_tryReconnect(uint8_t devIdx) {
     Wire.beginTransmission(dev.i2cAddress);
     if (Wire.endTransmission() == 0) {
         dev.online = true;
-        Serial.printf("[GREFUR] Device 0x%02X reconnected\n", dev.i2cAddress);
+        if (_onlineCallback) _onlineCallback(devIdx);
         return true;
     }
     return false;
@@ -164,6 +208,8 @@ uint8_t GrefurModuleMaster::scanAndDiscover() {
 
         dev.active = true;
         dev.online = true;
+        if (_discoveryCallback) _discoveryCallback(_deviceCount);
+        if (_activityCallback)  _activityCallback(_deviceCount);
         _deviceCount++;
     }
 
@@ -235,6 +281,8 @@ bool GrefurModuleMaster::scanAndDiscoverAsync() {
 
             dev.active = true;
             dev.online = true;
+            if (_discoveryCallback) _discoveryCallback(_deviceCount);
+            if (_activityCallback)  _activityCallback(_deviceCount);
             _deviceCount++;
         }
     }
@@ -257,14 +305,23 @@ void GrefurModuleMaster::resetScan() {
 // ─────────────────────────────────────────────────────────────────────────────
 
 bool GrefurModuleMaster::isModuleOnline(uint8_t devIdx) {
-    if (devIdx >= _deviceCount) return false;
-    Wire.beginTransmission(_devices[devIdx].i2cAddress);
-    bool online = (Wire.endTransmission() == 0);
-    if (online && !_devices[devIdx].online) {
-        Serial.printf("[GREFUR] Device 0x%02X reconnected\n", _devices[devIdx].i2cAddress);
+    if (devIdx >= _deviceCount) {
+        _notifyError(GREFUR_ERR_BAD_DEVICE_IDX, devIdx);
+        return false;
     }
-    _devices[devIdx].online = online;
-    return online;
+    GrefurDevice& dev = _devices[devIdx];
+    bool wasOnline = dev.online;
+
+    Wire.beginTransmission(dev.i2cAddress);
+    dev.online = (Wire.endTransmission() == 0);
+
+    if (!wasOnline && dev.online) {
+        if (_onlineCallback) _onlineCallback(devIdx);
+    } else if (wasOnline && !dev.online) {
+        if (_offlineCallback) _offlineCallback(devIdx);
+    }
+
+    return dev.online;
 }
 
 void GrefurModuleMaster::checkAllModulesOnline() {
@@ -278,14 +335,22 @@ void GrefurModuleMaster::checkAllModulesOnline() {
 // ─────────────────────────────────────────────────────────────────────────────
 
 bool GrefurModuleMaster::pollRegister(uint8_t devIdx, uint8_t regIdx) {
-    if (devIdx >= _deviceCount) return false;
+    if (devIdx >= _deviceCount) {
+        _notifyError(GREFUR_ERR_BAD_DEVICE_IDX, devIdx);
+        return false;
+    }
     GrefurDevice& dev = _devices[devIdx];
     if (!dev.active) return false;
 
-    // Attempt reconnect if offline before giving up
-    if (!dev.online && !_tryReconnect(devIdx)) return false;
+    if (!dev.online && !_tryReconnect(devIdx)) {
+        _notifyError(GREFUR_ERR_DEVICE_OFFLINE, devIdx);
+        return false;
+    }
 
-    if (regIdx >= dev.regCount) return false;
+    if (regIdx >= dev.regCount) {
+        _notifyError(GREFUR_ERR_BAD_REGISTER_IDX, devIdx);
+        return false;
+    }
 
     GrefurMasterReg& reg = dev.registers[regIdx];
     uint8_t size = _getTypeSize(reg.dataType);
@@ -295,7 +360,9 @@ bool GrefurModuleMaster::pollRegister(uint8_t devIdx, uint8_t regIdx) {
     for (int retry = 0; retry < GREFUR_I2C_RETRIES; retry++) {
         if (_readRegisterBytes(dev.i2cAddress, reg.address, size, buf)) {
             _storeValue(reg, buf, size);
-            if (reg.changed && _changeCallback != nullptr) {
+            if (_activityCallback) _activityCallback(devIdx);
+            if (_readCallback)     _readCallback(devIdx, regIdx, reg.lastValue);
+            if (reg.changed && _changeCallback) {
                 _changeCallback(devIdx, regIdx, reg.lastValue);
             }
             return true;
@@ -303,18 +370,25 @@ bool GrefurModuleMaster::pollRegister(uint8_t devIdx, uint8_t regIdx) {
     }
 
     // All retries exhausted — mark offline
+    bool wasOnline = dev.online;
     dev.online = false;
-    Serial.printf("[GREFUR] Device 0x%02X went offline\n", dev.i2cAddress);
+    if (wasOnline && _offlineCallback) _offlineCallback(devIdx);
+    _notifyError(GREFUR_ERR_READ_FAILED, devIdx);
     return false;
 }
 
 bool GrefurModuleMaster::pollDevice(uint8_t devIdx) {
-    if (devIdx >= _deviceCount) return false;
+    if (devIdx >= _deviceCount) {
+        _notifyError(GREFUR_ERR_BAD_DEVICE_IDX, devIdx);
+        return false;
+    }
     GrefurDevice& dev = _devices[devIdx];
     if (!dev.active) return false;
 
-    // Attempt reconnect if offline before iterating registers
-    if (!dev.online && !_tryReconnect(devIdx)) return false;
+    if (!dev.online && !_tryReconnect(devIdx)) {
+        _notifyError(GREFUR_ERR_DEVICE_OFFLINE, devIdx);
+        return false;
+    }
 
     bool success = true;
     for (uint8_t r = 0; r < dev.regCount; r++) {
@@ -323,13 +397,14 @@ bool GrefurModuleMaster::pollDevice(uint8_t devIdx) {
     return success;
 }
 
-/* {Finds a discovered register by raw I2C and register address, reconnects if needed, and polls} */
 bool GrefurModuleMaster::pollAddress(uint8_t i2cAddr, uint16_t regAddr) {
     for (uint8_t i = 0; i < _deviceCount; i++) {
         if (_devices[i].i2cAddress != i2cAddr) continue;
 
-        // Attempt reconnect if offline
-        if (!_devices[i].online && !_tryReconnect(i)) return false;
+        if (!_devices[i].online && !_tryReconnect(i)) {
+            _notifyError(GREFUR_ERR_DEVICE_OFFLINE, i);
+            return false;
+        }
 
         for (uint8_t r = 0; r < _devices[i].regCount; r++) {
             if (_devices[i].registers[r].address == regAddr) {
@@ -338,6 +413,85 @@ bool GrefurModuleMaster::pollAddress(uint8_t i2cAddr, uint16_t regAddr) {
         }
     }
     return false;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Write
+// ─────────────────────────────────────────────────────────────────────────────
+
+bool GrefurModuleMaster::writeToModule(uint8_t devIdx, uint8_t regIdx, GrefurValue value) {
+    if (devIdx >= _deviceCount) {
+        _notifyError(GREFUR_ERR_BAD_DEVICE_IDX, devIdx);
+        return false;
+    }
+    GrefurDevice& dev = _devices[devIdx];
+    if (!dev.active) return false;
+
+    if (!dev.online && !_tryReconnect(devIdx)) {
+        _notifyError(GREFUR_ERR_DEVICE_OFFLINE, devIdx);
+        return false;
+    }
+
+    if (regIdx >= dev.regCount) {
+        _notifyError(GREFUR_ERR_BAD_REGISTER_IDX, devIdx);
+        return false;
+    }
+
+    GrefurMasterReg& reg = dev.registers[regIdx];
+    if (!reg.writable) {
+        _notifyError(GREFUR_ERR_NOT_WRITABLE, devIdx);
+        return false;
+    }
+
+    if (!_writeRegisterBytes(dev.i2cAddress, reg.address, reg.dataType, value)) {
+        _notifyError(GREFUR_ERR_WRITE_FAILED, devIdx);
+        return false;
+    }
+
+    if (_activityCallback) _activityCallback(devIdx);
+    if (_writeCallback)    _writeCallback(devIdx, regIdx, value);
+    return true;
+}
+
+bool GrefurModuleMaster::writeRaw(uint8_t devAddr, uint16_t regAddr, uint8_t type, GrefurValue value) {
+    if (!_writeRegisterBytes(devAddr, regAddr, type, value)) {
+        _notifyError(GREFUR_ERR_WRITE_FAILED, 0xFF);  // 0xFF = ukjent devIdx
+        return false;
+    }
+    if (_activityCallback) _activityCallback(0xFF);
+    return true;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Register Lookup by Name
+// ─────────────────────────────────────────────────────────────────────────────
+
+int8_t GrefurModuleMaster::findRegisterByName(uint8_t devIdx, const char* name) {
+    if (devIdx >= _deviceCount) return -1;
+    GrefurDevice& dev = _devices[devIdx];
+    for (uint8_t i = 0; i < dev.regCount; i++) {
+        if (strncmp(dev.registers[i].name, name, GREFUR_NAME_LEN) == 0) return (int8_t)i;
+    }
+    return -1;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Typed Value Getters (by device/register index)
+// ─────────────────────────────────────────────────────────────────────────────
+
+float GrefurModuleMaster::getFloat(uint8_t devIdx, uint8_t regIdx) {
+    if (devIdx >= _deviceCount || regIdx >= _devices[devIdx].regCount) return 0.0f;
+    return _devices[devIdx].registers[regIdx].lastValue.asFloat;
+}
+
+int32_t GrefurModuleMaster::getInt(uint8_t devIdx, uint8_t regIdx) {
+    if (devIdx >= _deviceCount || regIdx >= _devices[devIdx].regCount) return 0;
+    return _devices[devIdx].registers[regIdx].lastValue.asI32;
+}
+
+uint32_t GrefurModuleMaster::getUInt(uint8_t devIdx, uint8_t regIdx) {
+    if (devIdx >= _deviceCount || regIdx >= _devices[devIdx].regCount) return 0;
+    return _devices[devIdx].registers[regIdx].lastValue.asU32;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -369,9 +523,8 @@ int32_t GrefurModuleMaster::getIntByAddress(uint8_t i2cAddr, uint16_t regAddr) {
     for (uint8_t i = 0; i < _deviceCount; i++) {
         if (_devices[i].i2cAddress == i2cAddr) {
             for (uint8_t r = 0; r < _devices[i].regCount; r++) {
-                if (_devices[i].registers[r].address == regAddr) {
+                if (_devices[i].registers[r].address == regAddr)
                     return _devices[i].registers[r].lastValue.asI32;
-                }
             }
         }
     }
@@ -382,75 +535,12 @@ float GrefurModuleMaster::getFloatByAddress(uint8_t i2cAddr, uint16_t regAddr) {
     for (uint8_t i = 0; i < _deviceCount; i++) {
         if (_devices[i].i2cAddress == i2cAddr) {
             for (uint8_t r = 0; r < _devices[i].regCount; r++) {
-                if (_devices[i].registers[r].address == regAddr) {
+                if (_devices[i].registers[r].address == regAddr)
                     return _devices[i].registers[r].lastValue.asFloat;
-                }
             }
         }
     }
     return 0.0f;
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Write
-// ─────────────────────────────────────────────────────────────────────────────
-
-bool GrefurModuleMaster::writeToModule(uint8_t devIdx, uint8_t regIdx, GrefurValue value) {
-    if (devIdx >= _deviceCount) return false;
-    GrefurDevice& dev = _devices[devIdx];
-    if (!dev.active) return false;
-
-    // Attempt reconnect before write
-    if (!dev.online && !_tryReconnect(devIdx)) return false;
-
-    if (regIdx >= dev.regCount) return false;
-    GrefurMasterReg& reg = dev.registers[regIdx];
-    if (!reg.writable) return false;
-    return _writeRegisterBytes(dev.i2cAddress, reg.address, reg.dataType, value);
-}
-
-bool GrefurModuleMaster::writeRaw(uint8_t devAddr, uint16_t regAddr, uint8_t type, GrefurValue value) {
-    return _writeRegisterBytes(devAddr, regAddr, type, value);
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Register Lookup by Name
-// ─────────────────────────────────────────────────────────────────────────────
-
-int8_t GrefurModuleMaster::findRegisterByName(uint8_t devIdx, const char* name) {
-    if (devIdx >= _deviceCount) return -1;
-    GrefurDevice& dev = _devices[devIdx];
-    for (uint8_t i = 0; i < dev.regCount; i++) {
-        if (strncmp(dev.registers[i].name, name, GREFUR_NAME_LEN) == 0) return (int8_t)i;
-    }
-    return -1;
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Change Callback
-// ─────────────────────────────────────────────────────────────────────────────
-
-void GrefurModuleMaster::onValueChanged(GrefurChangeCallback callback) {
-    _changeCallback = callback;
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Typed Value Getters (by device/register index)
-// ─────────────────────────────────────────────────────────────────────────────
-
-float GrefurModuleMaster::getFloat(uint8_t devIdx, uint8_t regIdx) {
-    if (devIdx >= _deviceCount || regIdx >= _devices[devIdx].regCount) return 0.0f;
-    return _devices[devIdx].registers[regIdx].lastValue.asFloat;
-}
-
-int32_t GrefurModuleMaster::getInt(uint8_t devIdx, uint8_t regIdx) {
-    if (devIdx >= _deviceCount || regIdx >= _devices[devIdx].regCount) return 0;
-    return _devices[devIdx].registers[regIdx].lastValue.asI32;
-}
-
-uint32_t GrefurModuleMaster::getUInt(uint8_t devIdx, uint8_t regIdx) {
-    if (devIdx >= _deviceCount || regIdx >= _devices[devIdx].regCount) return 0;
-    return _devices[devIdx].registers[regIdx].lastValue.asU32;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
