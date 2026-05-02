@@ -12,7 +12,11 @@ GrefurSlaveModule::GrefurSlaveModule(uint16_t deviceId)
     : _deviceId(deviceId),
       _regCount(0),
       _writeCallback(nullptr),
-      _selectedAddr16(0),   // uint16_t — 2-byte register address
+      _readCallback(nullptr),
+      _errorCallback(nullptr),
+      _discoveryCallback(nullptr),
+      _activityCallback(nullptr),
+      _selectedAddr16(0),
       _discoveryIdx(0),
       _pendingWrite(false),
       _pendingRegAddr(0),
@@ -32,10 +36,26 @@ void GrefurSlaveModule::begin(uint8_t i2cAddr) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Register a write callback
+// Callback Setters
 // ─────────────────────────────────────────────────────────────────────────────
 void GrefurSlaveModule::onWrite(GrefurWriteCallback callback) {
     _writeCallback = callback;
+}
+
+void GrefurSlaveModule::onRead(GrefurReadCallback callback) {
+    _readCallback = callback;
+}
+
+void GrefurSlaveModule::onError(GrefurErrorCallback callback) {
+    _errorCallback = callback;
+}
+
+void GrefurSlaveModule::onDiscovery(GrefurSimpleCallback callback) {
+    _discoveryCallback = callback;
+}
+
+void GrefurSlaveModule::onActivity(GrefurSimpleCallback callback) {
+    _activityCallback = callback;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -75,10 +95,18 @@ void GrefurSlaveModule::_applyPendingWrite() {
 
     for (uint8_t i = 0; i < _regCount; i++) {
         GrefurSlaveReg& r = _regs[i];
-        if (r.addr != _pendingRegAddr || !r.writable) continue;
+        if (r.addr != _pendingRegAddr) continue;
+
+        if (!r.writable) {
+            _notifyError(GREFUR_ERR_NOT_WRITABLE);
+            return;
+        }
 
         uint8_t size = _getTypeSize(r.type);
-        if (_pendingLen < size) return;
+        if (_pendingLen < size) {
+            _notifyError(GREFUR_ERR_BAD_LENGTH);
+            return;
+        }
 
         uint32_t raw = 0;
         for (uint8_t b = 0; b < size; b++) raw = (raw << 8) | _pendingBuf[b];
@@ -91,11 +119,12 @@ void GrefurSlaveModule::_applyPendingWrite() {
             case GREFUR_T_F32: memcpy(r.dataPtr, &raw, 4);            break;
         }
 
-        if (_writeCallback) {
-            _writeCallback(r.addr, _pendingBuf, size);
-        }
+        if (_writeCallback) _writeCallback(r.addr, _pendingBuf, size);
         return;
     }
+
+    // No matching register found
+    _notifyError(GREFUR_ERR_UNKNOWN_REG);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -103,7 +132,16 @@ void GrefurSlaveModule::_applyPendingWrite() {
 // Expects: [addrHi(1), addrLo(1), ...payload...]
 // ─────────────────────────────────────────────────────────────────────────────
 void GrefurSlaveModule::_handleReceive(int n) {
-    if (n < 2 || !_instance) return;
+    if (!_instance) return;
+
+    if (n < 2) {
+        _instance->_notifyError(GREFUR_ERR_SHORT_PACKET);
+        while (Wire.available()) Wire.read();
+        return;
+    }
+
+    // Any valid I2C hit — fire activity callback
+    if (_instance->_activityCallback) _instance->_activityCallback();
 
     uint8_t hi = Wire.read();
     uint8_t lo = Wire.read();
@@ -114,6 +152,7 @@ void GrefurSlaveModule::_handleReceive(int n) {
         if (addr == 0x0000) {
             // Discovery mode: next byte is register index to describe
             _instance->_discoveryIdx = Wire.read();
+            if (_instance->_discoveryCallback) _instance->_discoveryCallback();
         } else {
             // Write to a data register — buffer the payload bytes
             uint8_t avail = Wire.available();
@@ -138,6 +177,9 @@ void GrefurSlaveModule::_handleReceive(int n) {
 void GrefurSlaveModule::_handleRequest() {
     if (!_instance) return;
 
+    // Any valid I2C hit — fire activity callback
+    if (_instance->_activityCallback) _instance->_activityCallback();
+
     uint16_t sel = _instance->_selectedAddr16;
 
     // ── 0x0000: Metadata Discovery ────────────────────────────────────────────
@@ -146,14 +188,16 @@ void GrefurSlaveModule::_handleRequest() {
         if (idx < _instance->_regCount) {
             GrefurSlaveReg& r = _instance->_regs[idx];
             uint8_t nLen = strnlen(r.name, GREFUR_NAME_LEN);
-            Wire.write(_instance->_regCount);          // Total register count
-            Wire.write((r.addr >> 8) & 0xFF);          // Register address MSB
-            Wire.write(r.addr & 0xFF);                 // Register address LSB
-            Wire.write(r.type);                        // Data type
-            Wire.write((uint8_t)r.writable);           // Writable flag
-            Wire.write(nLen);                          // Name length
-            Wire.write((const uint8_t*)r.name, nLen);  // Name bytes
+            Wire.write(_instance->_regCount);
+            Wire.write((r.addr >> 8) & 0xFF);
+            Wire.write(r.addr & 0xFF);
+            Wire.write(r.type);
+            Wire.write((uint8_t)r.writable);
+            Wire.write(nLen);
+            Wire.write((const uint8_t*)r.name, nLen);
+            if (_instance->_discoveryCallback) _instance->_discoveryCallback();
         } else {
+            _instance->_notifyError(GREFUR_ERR_BAD_DISCOVERY_IDX);
             Wire.write((uint8_t)0x00);
         }
         return;
@@ -163,6 +207,7 @@ void GrefurSlaveModule::_handleRequest() {
     if (sel == 0x0001) {
         Wire.write(_instance->_deviceId >> 8);
         Wire.write(_instance->_deviceId & 0xFF);
+        if (_instance->_readCallback) _instance->_readCallback(sel);
         return;
     }
 
@@ -187,9 +232,12 @@ void GrefurSlaveModule::_handleRequest() {
         for (int8_t b = size - 1; b >= 0; b--) {
             Wire.write((raw >> (b * 8)) & 0xFF);
         }
+
+        if (_instance->_readCallback) _instance->_readCallback(sel);
         return;
     }
 
-    // Unknown register — send 0xFF as sentinel to avoid master desync
+    // Unknown register — send 0xFF sentinel and notify error
+    _instance->_notifyError(GREFUR_ERR_UNKNOWN_REG);
     Wire.write((uint8_t)0xFF);
 }
